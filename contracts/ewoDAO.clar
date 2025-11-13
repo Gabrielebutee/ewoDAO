@@ -11,6 +11,7 @@
 ;; Contract owner for admin functions
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-proposal-id uint u1)
+(define-data-var slashed-funds uint u0)
 
 ;; Enhanced proposal structure with cancellation fields
 (define-map proposals uint { 
@@ -23,7 +24,8 @@
   proposal-stake: uint,
   cancelled: bool,
   cancellation-votes: uint,
-  stake-slashed: bool
+  stake-slashed: bool,
+  stake-returned: bool
 })
 
 (define-map votes (tuple (proposal-id uint) (voter principal)) { weight: uint })
@@ -52,7 +54,8 @@
         proposal-stake: proposal-stake,
         cancelled: false,
         cancellation-votes: u0,
-        stake-slashed: false
+        stake-slashed: false,
+        stake-returned: false
       })
       
       ;; Increment proposal counter
@@ -118,16 +121,20 @@
       (asserts! (not (get cancelled proposal-data)) (err u14))
       
       ;; Mark as cancelled and slash stake (keep 50% as penalty)
-      (map-set proposals id (merge proposal-data { 
-        cancelled: true,
-        stake-slashed: true
-      }))
-      
-      ;; Return only 50% of stake to proposer (rest stays in contract as penalty)
-      (let ((partial-refund (/ (get proposal-stake proposal-data) u2)))
-        (try! (as-contract (stx-transfer? partial-refund tx-sender (get proposer proposal-data)))))
-      
-      (ok true))))
+      (let (
+        (proposal-stake (get proposal-stake proposal-data))
+        (partial-refund (/ proposal-stake u2))
+        (slash-amount (- proposal-stake partial-refund))
+      )
+        (map-set proposals id (merge proposal-data { 
+          cancelled: true,
+          stake-slashed: true,
+          stake-returned: false
+        }))
+        (var-set slashed-funds (+ (var-get slashed-funds) slash-amount))
+        ;; Return only 50% of stake to proposer (rest stays in contract as penalty)
+        (try! (as-contract (stx-transfer? partial-refund tx-sender (get proposer proposal-data))))
+        (ok true)))))
 
 ;; Community-driven proposal cancellation
 (define-public (vote-to-cancel (id uint) (stake uint))
@@ -175,8 +182,10 @@
               (map-set proposals id (merge proposal-data { 
                 cancelled: true,
                 stake-slashed: true,
+                stake-returned: false,
                 cancellation-votes: new-cancellation-votes
               }))
+              (var-set slashed-funds (+ (var-get slashed-funds) (get proposal-stake proposal-data)))
               ;; No refund for community-cancelled proposals
               (ok true))
             (ok true)))))
@@ -197,6 +206,7 @@
       (asserts! (not (get executed proposal-data)) (err u7))
       (asserts! (not (get cancelled proposal-data)) (err u14))
       (asserts! (not (get stake-slashed proposal-data)) (err u17))
+      (asserts! (not (get stake-returned proposal-data)) (err u19))
       
       ;; Must be past execution time
       (asserts! (>= stacks-block-height execution-time) (err u9))
@@ -205,7 +215,10 @@
       (asserts! (<= (get votes-for proposal-data) (get votes-against proposal-data)) (err u18))
       
       ;; Mark stake as withdrawn and return it
-      (map-set proposals id (merge proposal-data { stake-slashed: true }))
+      (map-set proposals id (merge proposal-data { 
+        stake-returned: true,
+        stake-slashed: false
+      }))
       (try! (as-contract (stx-transfer? (get proposal-stake proposal-data) tx-sender (get proposer proposal-data))))
       
       (ok true))))
@@ -232,7 +245,11 @@
       (asserts! (> (get votes-for proposal-data) (get votes-against proposal-data)) (err u10))
       
       ;; Mark as executed
-      (map-set proposals id (merge proposal-data { executed: true }))
+      (map-set proposals id (merge proposal-data { 
+        executed: true,
+        stake-returned: true,
+        stake-slashed: false
+      }))
       
       ;; Return proposal stake to proposer
       (try! (as-contract (stx-transfer? (get proposal-stake proposal-data) tx-sender (get proposer proposal-data))))
@@ -254,6 +271,16 @@
     (asserts! (is-eq tx-sender (var-get contract-owner)) (err u11))
     (var-set voting-paused (not (var-get voting-paused)))
     (ok (var-get voting-paused))))
+
+;; Admin-controlled distribution of accumulated slashed funds
+(define-public (withdraw-slashed-funds (recipient principal) (amount uint))
+  (let ((available (var-get slashed-funds)))
+    (begin
+      (asserts! (is-eq tx-sender (var-get contract-owner)) (err u11))
+      (asserts! (<= amount available) (err u20))
+      (var-set slashed-funds (- available amount))
+      (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+      (ok true))))
 
 ;; Enhanced read-only functions for governance state
 (define-read-only (get-proposal (id uint))
@@ -346,3 +373,6 @@
     cancellation-threshold: CANCELLATION-THRESHOLD,
     emergency-cancellation-period: EMERGENCY-CANCELLATION-PERIOD
   })
+
+(define-read-only (get-slashed-funds)
+  (var-get slashed-funds))
